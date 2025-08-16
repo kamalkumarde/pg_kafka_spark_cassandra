@@ -1,6 +1,6 @@
 services:   
   postgres:
-    image: postgres:14
+    image: postgres:latest
     restart: on-failure
     container_name: ${DOCKER_CONTAINER}
     env_file:
@@ -110,7 +110,147 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-    
+  spark-iceberg:
+    image: tabulario/spark-iceberg
+    container_name: spark-iceberg
+    build: spark/
+    networks:
+      iceberg_net:
+    depends_on:
+      - rest
+      - minio
+    volumes:
+      - ./warehouse:/home/iceberg/warehouse
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - ./data:/home/iceberg/data
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    ports:
+      - 8888:8888
+      - 8080:8080
+      - 10000:10000
+      - 10001:10001
+      - 4040-4042:4040-4042
+  rest:
+    image: tabulario/iceberg-rest
+    container_name: iceberg-rest
+    networks:
+      iceberg_net:
+    ports:
+      - 8181:8181
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    networks:
+      iceberg_net:
+        aliases:
+          - warehouse.minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: ["server", "/data", "--console-address", ":9001"]
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    networks:
+      iceberg_net:
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting for MinIO...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/warehouse || true;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      tail -f /dev/null
+      "
+  cassandra:
+    image: cassandra:4.0
+    container_name: cassandra
+    environment:
+      CASSANDRA_CLUSTER_NAME: LocalCluster
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./configs/grafana/datasources:/etc/grafana/provisioning/datasources
+
+  # PostgreSQL Exporter
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    container_name: postgres-exporter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:password@postgresql:5432/pipeline_db?sslmode=disable"
+    ports:
+      - "9187:9187"
+
+  # Kafka Exporter
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: kafka-exporter
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9308:9308"
+    command: "--kafka.server=kafka:29092"         
+networks:
+  iceberg_net:  
 volumes:
   postgres-data:
   pgadmin-data:
